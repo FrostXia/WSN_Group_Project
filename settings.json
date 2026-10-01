@@ -1,0 +1,10 @@
+{
+  "offline_seconds": 120,
+  "stale_seconds": 120,
+  "alerts_enabled": false,
+  "thresholds": {
+    "temperature": {"direction": "high", "value": 40},
+    "humidity": {"direction": "low", "value": 20}
+  },
+  "node_rooms": {}
+}

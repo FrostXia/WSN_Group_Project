@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#090b0b" />
+    <title>Laboratory Environment Monitor</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Primary navigation">
+        <div class="brand"><span class="brand-mark">L</span><span>LAB<br />SENSE</span></div>
+        <nav>
+          <a class="nav-item active" href="#overview"><span>▦</span>Overview</a>
+          <a class="nav-item" href="#trend"><span>⌁</span>Trends</a>
+          <a class="nav-item" href="#network"><span>⇄</span>Network</a>
+          <a class="nav-item" href="#alerts"><span>△</span>Alerts <b id="alertBadge">0</b></a>
+        </nav>
+        <div class="sidebar-foot">
+          <span class="pulse-dot"></span><span id="connectionText">Connecting to data service</span>
+          <small>Refresh interval: 5 seconds</small>
+        </div>
+      </aside>
+
+      <main>
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Laboratory environment monitoring</p>
+            <h1>Environment overview</h1>
+          </div>
+          <div class="header-actions">
+            <span class="timestamp" id="updatedAt">--</span>
+            <button class="refresh-button" id="refreshButton" type="button" aria-label="Refresh data now">↻ <span>Refresh now</span></button>
+          </div>
+        </header>
+
+        <section id="overview" class="status-strip" aria-label="System status">
+          <div><span class="status-label">System status</span><strong id="systemStatus" class="status-ok">Waiting for data</strong></div>
+          <div><span class="status-label">Online nodes</span><strong id="onlineNodes">0 / 0</strong></div>
+          <div><span class="status-label">Metrics monitored</span><strong id="metricCount">0</strong></div>
+          <div><span class="status-label">Active alerts</span><strong id="activeAlerts">0</strong></div>
+        </section>
+
+        <section class="section-heading">
+          <div><p class="eyebrow">Live readings</p><h2>Node status</h2></div>
+          <div class="legend"><span><i class="legend-ok"></i>Normal</span><span><i class="legend-warning"></i>Attention</span><span><i class="legend-offline"></i>Offline</span></div>
+        </section>
+        <section id="nodeGrid" class="node-grid" aria-live="polite"></section>
+
+        <section id="trend" class="trend-section">
+          <div class="section-heading compact">
+            <div><p class="eyebrow">Last hour</p><h2>Node trend analysis</h2><p id="trendDescription" class="trend-description">Waiting for nodes</p></div>
+            <div id="trendNodeButtons" class="trend-node-buttons" aria-label="Select a sensor node"></div>
+          </div>
+          <div id="trendGrid" class="trend-grid" aria-live="polite"></div>
+        </section>
+
+        <section id="network" class="alerts-section">
+          <div class="section-heading"><div><p class="eyebrow">Wireless routes</p><h2>Last observed paths</h2></div></div>
+          <p class="trend-description">Paths come from delivered packets. RSSI and ACK probability describe the source's first hop; this is not a full neighbour map.</p>
+          <div class="network-wrap"><table><thead><tr><th>Node</th><th>Path</th><th>Cost</th><th>ACK probability</th><th>RSSI (dBm)</th></tr></thead><tbody id="networkRows"></tbody></table></div>
+        </section>
+        <section id="alerts" class="alerts-section">
+          <div class="section-heading compact"><div><p class="eyebrow">Safety events</p><h2>Alert centre</h2></div><span class="alert-caption">Based on configured backend thresholds</span></div>
+          <div id="alertList" class="alert-list"></div>
+        </section>
+      </main>
+    </div>
+    <template id="nodeTemplate">
+      <article class="node-card">
+        <div class="node-card-head"><div><span class="room-label"></span><h3></h3></div><span class="node-state"></span></div>
+        <div class="reading-grid"></div>
+        <footer><span class="last-seen"></span><button type="button" class="focus-node">View trend →</button></footer>
+      </article>
+    </template>
+    <script src="app.js"></script>
+  </body>
+</html>
