@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def iso(value):
-    return value.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+    return value.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
 def build_upload(raw, observed=None):
@@ -38,13 +38,16 @@ def build_upload(raw, observed=None):
     samples = []
     for field, kind, unit, bit in (("temperature", "temperature", "°C", 1),
                                   ("humidity", "humidity", "%", 1),
-                                  ("lux", "light", "lux", 2), ("motion", "pir", "", 4)):
-        if not mask & bit:
-            continue
+                                  ("lux", "light", "lux", 2), ("motion", "pir", "", 4),
+                                  ("presence", "mmwave", "", 8),
+                                  ("mq2_voltage", "mq2_voltage", "V", 16),
+                                  ("dust_voltage", "dust_voltage", "V", 32)):
         value = raw.get(field)
-        good = bool(valid & bit) and type(value) in (int, float) and math.isfinite(value)
+        good = bool(mask & valid & bit) and type(value) in (int, float) and math.isfinite(value)
+        if kind in ("pir", "mmwave") and value not in (0, 1):
+            good = False
         samples.append(dict(sensor_type=kind, value=value if good else None, unit=unit,
-                            quality="valid" if good else "fault", recorded_at=iso(recorded)))
+                            quality="valid" if good else "unknown", recorded_at=iso(recorded)))
     def finite(name):
         v = raw.get(name)
         return v if type(v) in (int, float) and math.isfinite(v) else None

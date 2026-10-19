@@ -25,3 +25,11 @@ CREATE TABLE IF NOT EXISTS ls_samples (
 );
 CREATE INDEX IF NOT EXISTS ls_packet_node_time ON ls_packets(node_id,observed_at);
 CREATE INDEX IF NOT EXISTS ls_sample_time ON ls_samples(recorded_at,sensor_type);
+
+CREATE TABLE IF NOT EXISTS ls_sensor_events (
+  node_id TEXT NOT NULL REFERENCES ls_nodes(node_id),
+  sensor_type TEXT NOT NULL,
+  changed_at TEXT NOT NULL,
+  enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+  PRIMARY KEY(node_id,sensor_type,changed_at)
+);

@@ -13,7 +13,8 @@ from flask import Flask, jsonify, request, send_from_directory
 
 ROOT = Path(__file__).resolve().parents[1]
 SENSOR_UNITS = {"temperature": "°C", "humidity": "%", "light": "lux",
-                "pir": "", "smoke": "ppm", "gas": "ppm", "mmwave": ""}
+                "pir": "", "smoke": "ppm", "gas": "ppm", "mmwave": "", "mq2_voltage": "V", "dust_voltage": "V"}
+MANUAL_SENSORS = ("pir", "mq2_voltage", "dust_voltage")
 
 
 def utcnow():
@@ -21,7 +22,7 @@ def utcnow():
 
 
 def iso(value):
-    return value.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+    return value.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
 def timestamp(value):
@@ -203,9 +204,72 @@ def create_app(db_path=None, database_url=None):
     def get_settings():
         return jsonify(settings)
 
+    def sensor_events(conn):
+        return db.rows(conn, "SELECT * FROM ls_sensor_events ORDER BY changed_at")
+
+    def policy_at(events, node, kind, at):
+        matches = [e for e in events if e["node_id"] == node and
+                   e["sensor_type"] == kind and e["changed_at"] <= at]
+        return bool(matches and matches[-1]["enabled"])
+
+    def apply_sample_policy(row, events, node, current=False):
+        kind = row["sensor_type"]
+        if kind in MANUAL_SENSORS:
+            allowed = policy_at(events, node, kind, row["recorded_at"])
+            if current:
+                matches = [e for e in events if e["node_id"] == node and e["sensor_type"] == kind]
+                allowed = allowed and bool(matches and matches[-1]["enabled"] and
+                                          row["recorded_at"] >= matches[-1]["changed_at"])
+            if not allowed:
+                row.update(value=None, quality="unknown")
+        return row
+
+    def sensor_controls(events, node):
+        return {kind: policy_at(events, node, kind, iso(utcnow())) for kind in MANUAL_SENSORS}
+
+    @app.put("/api/nodes/<node_id>/sensors/<kind>")
+    def set_sensor(node_id, kind):
+        if kind not in MANUAL_SENSORS:
+            raise ValueError("sensor is not manually controlled")
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict) or set(data) != {"enabled"} or type(data["enabled"]) is not bool:
+            raise ValueError("enabled must be a boolean")
+        with db.session() as conn:
+            if not db.rows(conn, "SELECT node_id FROM ls_nodes WHERE node_id=?", (node_id,)):
+                return jsonify(error="node not found"), 404
+            events = sensor_events(conn)
+            if sensor_controls(events, node_id)[kind] != data["enabled"]:
+                # Microsecond ordering prevents rapid toggles sharing a timestamp.
+                changed = utcnow().isoformat(timespec="microseconds")
+                db.execute(conn, "INSERT INTO ls_sensor_events VALUES (?,?,?,?)",
+                           (node_id, kind, changed, int(data["enabled"])))
+                events = sensor_events(conn)
+            controls = sensor_controls(events, node_id)
+        return jsonify(node_id=node_id, sensors=controls)
+
+    @app.get("/api/wifi-time")
+    def wifi_time():
+        return str(int(utcnow().timestamp() * 1000)), 200, {"Content-Type": "text/plain"}
+
+    @app.post("/api/wifi-upload")
+    def wifi_upload():
+        from gateway.collector import build_upload
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            raise ValueError("JSON object required")
+        ms = integer(body.get("observed_at_ms"), "observed_at_ms", 1700000000000, 4102444800000)
+        observed = datetime.fromtimestamp(ms / 1000, timezone.utc)
+        data = build_upload(body.get("raw"), observed)
+        if data is None:
+            raise ValueError("sample required")
+        response = save_packet(normalize(data))
+        return response.get_json()["status"], 200, {"Content-Type": "text/plain"}
+
     @app.post("/api/upload")
     def upload():
-        packet = normalize(request.get_json(silent=True), request.headers.get("Idempotency-Key"))
+        return save_packet(normalize(request.get_json(silent=True), request.headers.get("Idempotency-Key")))
+
+    def save_packet(packet):
         now = iso(utcnow())
         with db.session() as conn:
             db.execute(conn, """INSERT INTO ls_nodes(node_id,radio_id,room_id,last_seen)
@@ -222,7 +286,9 @@ def create_app(db_path=None, database_url=None):
             db.execute(conn, """UPDATE ls_nodes SET room_id=?,last_seen=?
                 WHERE node_id=? AND last_seen<=?""",
                 (packet["room"], packet["observed"], packet["node"], packet["observed"]))
+            events = sensor_events(conn)
             for s in packet["samples"]:
+                apply_sample_policy(s, events, packet["node"])
                 db.execute(conn, """INSERT INTO ls_samples
                     (packet_key,sensor_type,value,unit,recorded_at,quality) VALUES (?,?,?,?,?,?)""",
                     (packet["key"], s["sensor_type"], s["value"], s["unit"], s["recorded_at"], s["quality"]))
@@ -231,9 +297,10 @@ def create_app(db_path=None, database_url=None):
     def nodes():
         with db.session() as conn:
             result = db.rows(conn, "SELECT * FROM ls_nodes ORDER BY radio_id")
+            events = sensor_events(conn)
         for n in result:
             override = settings.get("node_rooms", {}).get(n["node_id"])
-            n.update(id=n["node_id"], label=f"ESP32 · {n['radio_id']:02d}",
+            n.update(sensors=sensor_controls(events, n["node_id"]), id=n["node_id"], label=f"ESP32 · {n['radio_id']:02d}",
                      room=override or (f"Room {n['room_id']}" if n["room_id"] else "Room unassigned"),
                      online=(utcnow()-datetime.fromisoformat(n["last_seen"])).total_seconds() <= offline_seconds)
         return result
@@ -251,8 +318,10 @@ def create_app(db_path=None, database_url=None):
                     ROW_NUMBER() OVER(PARTITION BY s.sensor_type ORDER BY s.recorded_at DESC,p.observed_at DESC) AS rn
                 FROM ls_samples s JOIN ls_packets p ON p.packet_key=s.packet_key WHERE p.node_id=?
                 ) ranked WHERE rn=1 ORDER BY sensor_type""", (node_id,))
+            events = sensor_events(conn)
         for row in rows:
             row.pop("rn", None)
+            apply_sample_policy(row, events, node_id, current=True)
         return jsonify(node_id=node_id, data=rows, count=len(rows))
 
     @app.get("/api/history")
@@ -276,6 +345,9 @@ def create_app(db_path=None, database_url=None):
         query += " ORDER BY s.recorded_at DESC,p.packet_key DESC LIMIT ?"; args.append(limit+1)
         with db.session() as conn:
             rows = db.rows(conn, query, args)
+            events = sensor_events(conn)
+        for row in rows:
+            apply_sample_policy(row, events, row["node_id"])
         return jsonify(data=rows[:limit], truncated=len(rows)>limit)
 
     @app.get("/api/network")
@@ -296,8 +368,10 @@ def create_app(db_path=None, database_url=None):
                   ROW_NUMBER() OVER(PARTITION BY p.node_id,s.sensor_type ORDER BY s.recorded_at DESC,p.observed_at DESC) AS rn
                 FROM ls_samples s JOIN ls_packets p ON p.packet_key=s.packet_key
                 ) ranked WHERE rn=1""")
+            events = sensor_events(conn)
         grouped = {}
         for row in rows:
+            apply_sample_policy(row, events, row["node_id"], current=True)
             row.pop("rn", None)
             grouped.setdefault(row["node_id"], []).append(row)
         return jsonify(nodes=nodes(), latest=grouped, network=network().get_json()["data"], settings=settings)
@@ -309,4 +383,4 @@ if __name__ == "__main__":
     app = create_app(os.environ.get("LAB_DB_PATH"), os.environ.get("DATABASE_URL"))
     port = int(os.environ.get("LAB_PORT", "5050"))
     print(f"Open http://127.0.0.1:{port} — local lab server; Ctrl+C to stop")
-    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
+    app.run(host=os.environ.get("LAB_HOST", "127.0.0.1"), port=port, debug=False, threaded=True)

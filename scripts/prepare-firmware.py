@@ -18,6 +18,7 @@ for node in args.nodes:
     for key, value in {"NODE_ID": node, "ROOT_ID": args.root, "ROOM_ID": 2 if node == 3 else 1}.items():
         config = re.sub(rf"(constexpr uint16_t {key} = )\d+;", rf"\g<1>{value};", config)
     (folder / "config.h").write_text(config, encoding="utf-8")
-    (folder / "app.cpp").write_bytes((base / "app.cpp").read_bytes())
+    for name in ("app.cpp", "sensors.cpp", "sensors.h", "radar_parser.h", "wifi_config.h", "wifi_transport.h"):
+        (folder / name).write_bytes((base / name).read_bytes())
     (folder / f"Node{node}.ino").write_bytes((base / "LabMesh.ino").read_bytes())
     print(folder)

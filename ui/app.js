@@ -3,9 +3,11 @@ const $ = s => document.querySelector(s);
 const METRICS = {
   temperature: {label:"Temperature",unit:"°C"}, humidity:{label:"Humidity",unit:"%"},
   light:{label:"Illuminance",unit:"lux"}, pir:{label:"Motion (PIR)",unit:"",presence:true},
-  smoke:{label:"Smoke",unit:"ppm"}, gas:{label:"Combustible gas",unit:"ppm"},
-  mmwave:{label:"mmWave",unit:"",presence:true}
+  mq2_voltage:{label:"MQ-2 response",unit:"V"}, dust_voltage:{label:"Estimated dust concentration",unit:"µg/m³"},
+  mmwave:{label:"Presence (mmWave)",unit:"",presence:true}
 };
+const manualSensors={pir:"PIR",mq2_voltage:"MQ-2",dust_voltage:"Dust sensor"};
+const savingSensors=new Set(), controlErrors=new Map(), openControls=new Set();
 let nodes=[], latest={}, networks=[], history=[], selected=null, connected=false, busy=false;
 let settings={offline_seconds:120,stale_seconds:120,alerts_enabled:false,thresholds:{}};
 let historyTruncated=false, trendUnavailable=false, historyGeneration=0;
@@ -17,18 +19,28 @@ const fresh = s => seconds(s.recorded_at)<=settings.stale_seconds;
 const readings = id => latest[id]||[];
 const online = n => connected && seconds(n.last_seen)<=settings.offline_seconds;
 function alert(s) {
+  if(!METRICS[s.sensor_type]) return false;
   const rule=settings.thresholds[s.sensor_type];
   return settings.alerts_enabled && s.quality==="valid" && fresh(s) && rule &&
     (rule.direction==="high" ? s.value>rule.value:s.value<rule.value);
 }
+// Stored dust_voltage remains sensor-side volts; convert only for presentation.
+// Nominal supplier parameters, not calibrated and not a PM2.5 measurement.
+function shownValue(s) {
+  if(!s || s.quality!=="valid" || !Number.isFinite(s.value)) return null;
+  return s.sensor_type==="dust_voltage" ? Math.max(0,(s.value-0.9)*200) : s.value;
+}
 function display(s,spec) {
-  if(!s) return "—";
-  if(s.quality!=="valid") return "Fault";
-  return spec.presence?(s.value===1?"Motion":"No motion"):num(s.value);
+  if(!s || s.quality!=="valid" || !Number.isFinite(s.value)) return "NoData";
+  if(spec===METRICS.mmwave) return s.value===1?"Present":"Absent";
+  return spec.presence?(s.value===1?"Motion":"No motion"):num(shownValue(s));
 }
 function metricKeys(id) {
-  const found=readings(id).map(s=>s.sensor_type).filter(k=>METRICS[k]);
-  return found.length?found:["temperature","humidity","light","pir"];
+  const node=nodes.find(n=>n.id===id);
+  return node && online(node) ? readings(id).filter(s=>METRICS[s.sensor_type] &&
+    s.quality==="valid" && Number.isFinite(s.value) && fresh(s) &&
+    (!(s.sensor_type in manualSensors) || node.sensors?.[s.sensor_type]))
+    .map(s=>s.sensor_type) : [];
 }
 async function get(path) {
   const res=await fetch(path,{signal:AbortSignal.timeout(5000),cache:"no-store"});
@@ -66,20 +78,35 @@ function renderNodes() {
   }
   for(const node of nodes) {
     const list=readings(node.id), active=online(node), warnings=list.some(alert);
-    const usable=list.some(s=>s.quality==="valid"&&fresh(s));
-    const faults=list.some(s=>s.quality!=="valid");
+    const usable=metricKeys(node.id).length>0;
     const fragment=$("#nodeTemplate").content.cloneNode(true), card=fragment.querySelector("article");
     fragment.querySelector(".room-label").textContent=node.room;
     fragment.querySelector("h3").textContent=node.label;
     const state=fragment.querySelector(".node-state");
-    state.textContent=!connected?"Status unknown":!active?"No recent packets":warnings?"Attention":faults?"Sensor fault":!usable?"Online · no fresh readings":"Online";
-    state.className=`node-state ${!active?"offline":warnings||faults?"warning":""}`;
-    card.classList.toggle("offline",!active);card.classList.toggle("warning",active&&(warnings||faults));
+    state.textContent=!connected?"Status unknown":!active?"No recent packets":warnings?"Attention":!usable?"Online · NoData":"Online";
+    state.className=`node-state ${!active?"offline":warnings?"warning":""}`;
+    card.classList.toggle("offline",!active);card.classList.toggle("warning",active&&(warnings));
     fragment.querySelector(".reading-grid").innerHTML=metricKeys(node.id).map(k=>{
       const spec=METRICS[k],s=list.find(v=>v.sensor_type===k);
       const label=s&&!fresh(s)?" · Stale":"";
       return `<div class="metric-reading ${!s?"no-reading":""}"><span class="reading-label">${esc(spec.label+label)}</span><span class="reading-value ${s&&alert(s)?"alert":""}">${esc(display(s,spec))}<small>${s&&s.quality==="valid"?esc(spec.unit):""}</small></span></div>`;
     }).join("");
+    if(!metricKeys(node.id).length) fragment.querySelector(".reading-grid").innerHTML='<p class="empty-alert">NoData</p>';
+    const controls=document.createElement("details");
+    controls.className="sensor-controls"; controls.open=openControls.has(node.id);
+    controls.ontoggle=()=>controls.open?openControls.add(node.id):openControls.delete(node.id);
+    const summary=document.createElement("summary"); summary.textContent="Sensor settings"; controls.append(summary);
+    for(const [kind,label] of Object.entries(manualSensors)) {
+      const row=document.createElement("label"), input=document.createElement("input"), name=document.createElement("span");
+      input.type="checkbox"; input.checked=!!node.sensors?.[kind];
+      input.disabled=!connected || savingSensors.has(node.id);
+      name.textContent=label; row.append(input); row.append(name); controls.append(row);
+      input.onchange=()=>setSensor(node.id,kind,input.checked);
+    }
+    const help=document.createElement("p");
+    help.textContent=controlErrors.get(node.id)||"Enable after connecting; disable after unplugging. These switches do not detect disconnection.";
+    help.setAttribute("role",controlErrors.has(node.id)?"alert":"note"); controls.append(help);
+    fragment.querySelector(".reading-grid").after(controls);
     const net=networks.find(v=>v.node_id===node.id);
     const info=document.createElement("p"); info.className="route-summary";
     info.textContent=`Last received ${clock(node.last_seen)} · Path: ${net?.path?.join(" → ")||"Unknown"}`;
@@ -90,6 +117,7 @@ function renderNodes() {
   }
 }
 function trendSvg(points,key) {
+  points=points.map(p=>({...p,value:shownValue(p)}));
   if(!points.length)return '<p class="empty-alert">No historical readings</p>';
   const good=points.filter(p=>p.quality==="valid"&&Number.isFinite(p.value));
   if(!good.length)return '<p class="empty-alert">No valid historical readings</p>';
@@ -114,11 +142,30 @@ function renderTrends() {
   $("#trendDescription").textContent=node?`${node.label} · ${trendUnavailable?"History unavailable":historyTruncated?"Latest 5,000 records; history truncated":"Last hour · gateway-estimated time"}`:"Select a node after data arrives";
   const buttons=$("#trendNodeButtons");buttons.replaceChildren();
   for(const n of nodes){const b=document.createElement("button");b.className=`trend-node-button ${n.id===selected?"active":""}`;b.textContent=n.label;b.onclick=()=>selectNode(n.id);buttons.append(b);}
-  $("#trendGrid").innerHTML=node?metricKeys(node.id).map(k=>{
+  const keys=node?[...new Set([...metricKeys(node.id),...history.filter(s=>
+    s.node_id===node.id && METRICS[s.sensor_type] && s.quality==="valid" &&
+    (!(s.sensor_type in manualSensors)||node.sensors?.[s.sensor_type]))
+    .map(s=>s.sensor_type)])]:[];
+  $("#trendGrid").innerHTML=node?keys.map(k=>{
     const points=history.filter(p=>p.node_id===selected&&p.sensor_type===k).sort((a,b)=>Date.parse(a.recorded_at)-Date.parse(b.recorded_at));
-    const s=points.at(-1), spec=METRICS[k];
+    const current=readings(node.id).find(s=>s.sensor_type===k);
+    const s=online(node)&&current&&fresh(current)?current:null, spec=METRICS[k];
     return `<article class="trend-card"><div class="trend-card-head"><span>${esc(spec.label)}</span><strong>${esc(display(s,spec))}<small>${s&&s.quality==="valid"?esc(spec.unit):""}</small></strong></div>${trendSvg(points,k)}</article>`;
   }).join(""):"";
+}
+async function setSensor(id,kind,enabled) {
+  savingSensors.add(id); controlErrors.delete(id); renderNodes();
+  try {
+    const response=await fetch(`/api/nodes/${encodeURIComponent(id)}/sensors/${kind}`, {
+      method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled}),signal:AbortSignal.timeout(5000)});
+    if(!response.ok) throw new Error(`HTTP ${response.status}`);
+    const result=await response.json();
+    const node=nodes.find(n=>n.id===id); if(node) node.sensors=result.sensors;
+    // Never reveal cached readings immediately after an enable/disable.
+    latest[id]=(latest[id]||[]).map(s=>s.sensor_type===kind?{...s,value:null,quality:"unknown"}:s);
+    await refresh();
+  } catch(e) { controlErrors.set(id,"Could not save sensor settings. Refresh and retry."); }
+  finally { savingSensors.delete(id); render(); }
 }
 async function selectNode(id){selected=id;history=[];renderTrends();await loadHistory();renderTrends();}
 function renderNetwork(){
@@ -133,15 +180,15 @@ function render(){
   const warnings=connected?nodes.filter(online).flatMap(n=>readings(n.id).filter(alert).map(s=>({n,s}))):[];
   const count=nodes.filter(online).length;
   $("#onlineNodes").textContent=`${count} / ${nodes.length}`;
-  $("#metricCount").textContent=new Set(Object.values(latest).flat().filter(s=>s.quality==="valid"&&fresh(s)).map(s=>s.sensor_type)).size;
+  $("#metricCount").textContent=new Set(nodes.flatMap(n=>metricKeys(n.id))).size;
   $("#activeAlerts").textContent=settings.alerts_enabled?warnings.length:"Disabled";
   $("#alertBadge").textContent=warnings.length;
-  const freshCount=nodes.filter(online).filter(n=>readings(n.id).some(s=>s.quality==="valid"&&fresh(s))).length;
+  const freshCount=nodes.filter(online).filter(n=>metricKeys(n.id).length>0).length;
   const status=$("#systemStatus");
   status.textContent=!connected?"Service unavailable":!nodes.length?"Waiting for nodes":!count?"No recent packets":warnings.length?"Attention required":!freshCount?"Waiting for readings":count<nodes.length?"Some nodes unavailable":"Receiving data";
   status.className=warnings.length||!connected?"status-warning":"status-ok";
   $("#updatedAt").textContent=`Checked ${clock(new Date().toISOString())}`;
-  $("#alertList").innerHTML=!connected?'<p class="empty-alert">Current alert state unavailable</p>':!settings.alerts_enabled?'<p class="empty-alert">Alerts disabled. Configure and validate thresholds in settings.json before enabling.</p>':warnings.length?warnings.map(({n,s})=>`<div class="alert-row"><span class="alert-icon">▲</span><div><strong>${esc(n.label)} · ${esc(METRICS[s.sensor_type].label)}</strong><p>${esc(num(s.value))} ${esc(METRICS[s.sensor_type].unit)}</p></div><span class="alert-time">${esc(clock(s.recorded_at))}</span></div>`).join(""):'<p class="empty-alert">No threshold breaches in fresh available readings. Missing data is not a safe-state confirmation.</p>';
+  $("#alertList").innerHTML=!connected?'<p class="empty-alert">Current alert state unavailable</p>':!settings.alerts_enabled?'<p class="empty-alert">Alerts disabled. Configure and validate thresholds in settings.json before enabling.</p>':warnings.length?warnings.map(({n,s})=>`<div class="alert-row"><span class="alert-icon">▲</span><div><strong>${esc(n.label)} · ${esc(METRICS[s.sensor_type].label)}</strong><p>${esc(num(shownValue(s)))} ${esc(METRICS[s.sensor_type].unit)}</p></div><span class="alert-time">${esc(clock(s.recorded_at))}</span></div>`).join(""):'<p class="empty-alert">No threshold breaches in fresh available readings. Missing data is not a safe-state confirmation.</p>';
   renderNodes();renderTrends();renderNetwork();
 }
 document.querySelectorAll(".nav-item").forEach(a=>a.addEventListener("click",()=>{

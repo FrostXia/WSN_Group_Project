@@ -10,16 +10,7 @@
 #if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 1, 0)
 #error "Requires Arduino-ESP32 3.x with ESP-IDF >= 5.1"
 #endif
-#if ENABLE_SENSORS && (SENSOR_MASK & 2)
-#include <Wire.h>
-#include <BH1750.h>
-static BH1750 lightMeter;
-static bool lightOK;
-#endif
-#if ENABLE_SENSORS && (SENSOR_MASK & 1)
-#include <DHT.h>
-static DHT dht(DHT_PIN, DHT11);
-#endif
+#include "sensors.h"
 
 // Same ESP32 little-endian IEEE754 wire ABI on all boards. Versioned, <=250B.
 enum Kind : uint8_t { ADV=1, PROBE=2, ACK=3, DATA=4, RECEIPT=5 };
@@ -28,11 +19,12 @@ struct __attribute__((packed)) Packet {
   uint8_t version, kind, metric, flags;
   uint16_t sender, root, source, room;
   uint32_t senderBoot, originBoot, seq, token, epoch, sampleAgeMs;
-  float cost, temperature, humidity, lux, linkQ, linkRssi;
-  uint8_t motion, valid, count, cursor, sensorMask;
+  float cost, temperature, humidity, lux, linkQ, linkRssi, mq2Voltage, dustVoltage;
+  uint8_t motion, valid, count, cursor, sensorMask, presence;
   uint16_t path[8];
 };
 static_assert(sizeof(Packet) <= 250, "ESP-NOW v1 packet budget");
+#include "wifi_transport.h"
 struct Rx { Packet p; uint8_t mac[6]; int8_t rssi; };
 struct Neighbor {
   bool used=false, verified=false;
@@ -68,7 +60,7 @@ static bool contains(const Packet &p,uint16_t id) {
   return false;
 }
 static Packet makePacket(Kind kind) {
-  Packet p{}; p.network=NETWORK_ID; p.version=2; p.kind=kind;
+  Packet p{}; p.network=NETWORK_ID; p.version=3; p.kind=kind;
   p.metric=ROUTING_METRIC; p.sender=NODE_ID; p.senderBoot=bootId; p.root=ROOT_ID;
   return p;
 }
@@ -78,7 +70,7 @@ static void event(const char *name,uint16_t other=0) {
 static bool addPeer(const uint8_t *mac) {
   if(esp_now_is_peer_exist(mac)) return true;
   esp_now_peer_info_t peer{}; memcpy(peer.peer_addr,mac,6);
-  peer.channel=RADIO_CHANNEL; peer.ifidx=WIFI_IF_STA; peer.encrypt=false;
+  peer.channel=0; peer.ifidx=WIFI_IF_STA; peer.encrypt=false;
   return esp_now_add_peer(&peer)==ESP_OK;
 }
 static bool sendRaw(const uint8_t *mac,const Packet &p) {
@@ -201,11 +193,15 @@ static bool enqueue(const Packet &p) {
 }
 static void pop() { for(unsigned i=1;i<outCount;i++) outbox[i-1]=outbox[i]; if(outCount) outCount--; }
 static void jsonFloat(float value) { if(isfinite(value)) Serial.print(value,3); else Serial.print("null"); }
-static void deliver(const Packet &p) {
+static bool deliver(const Packet &p) {
+  if(!queueUpload(p)) return false;
   Serial.printf("{\"type\":\"sample\",\"node\":%u,\"boot\":%lu,\"seq\":%lu,\"room\":%u,\"valid\":%u,\"temperature\":",
     p.source,(unsigned long)p.originBoot,(unsigned long)p.seq,p.room,p.valid);
   jsonFloat(p.temperature); Serial.print(",\"humidity\":"); jsonFloat(p.humidity);
   Serial.print(",\"lux\":"); jsonFloat(p.lux);
+  Serial.print(",\"mq2_voltage\":"); jsonFloat(p.mq2Voltage);
+  Serial.print(",\"dust_voltage\":"); jsonFloat(p.dustVoltage);
+  Serial.printf(",\"presence\":%u",p.presence);
   Serial.printf(",\"motion\":%u,\"path_cost\":",p.motion); jsonFloat(p.cost);
   Serial.print(",\"link_q\":"); jsonFloat(p.linkQ);
   Serial.print(",\"link_rssi\":"); jsonFloat(p.linkRssi);
@@ -214,6 +210,7 @@ static void deliver(const Packet &p) {
   for(unsigned i=0;i<p.count;i++) { if(i) Serial.print(','); Serial.print(p.path[i]); }
   if(p.count) Serial.print(',');
   Serial.printf("%u]}\n",ROOT_ID);
+  return true;
 }
 static void hopAck(const Rx &rx) {
   Packet a=makePacket(ACK); a.token=rx.p.token; a.originBoot=rx.p.senderBoot;
@@ -227,7 +224,7 @@ static void receipt(const Packet &data) {
 }
 static void handle(const Rx &rx) {
   const Packet &p=rx.p;
-  if(p.network!=NETWORK_ID || p.version!=2 || p.root!=ROOT_ID || p.metric!=ROUTING_METRIC ||
+  if(p.network!=NETWORK_ID || p.version!=3 || p.root!=ROOT_ID || p.metric!=ROUTING_METRIC ||
     !p.sender || p.sender==NODE_ID || p.count>MAX_PATH || p.kind<ADV || p.kind>RECEIPT) return;
   int ni=findNeighbor(rx); if(ni<0) return;
   Neighbor &n=neighbors[ni]; n.lastSeen=millis();
@@ -263,7 +260,7 @@ static void handle(const Rx &rx) {
   for(unsigned i=0;i<p.count;i++) for(unsigned j=0;j<i;j++) if(p.path[i]==p.path[j]) return;
   if(duplicate(p)) { hopAck(rx); if(NODE_ID==ROOT_ID) receipt(p); return; }
   if(NODE_ID==ROOT_ID) {
-    deliver(p); remember(p); hopAck(rx); receipt(p);
+    if(deliver(p)) { remember(p); hopAck(rx); receipt(p); }
   } else if(RELAY_ALLOWED && p.count<MAX_PATH-1) {
     if(enqueue(p)) { remember(p); hopAck(rx); }
   }
@@ -320,46 +317,45 @@ static void sample() {
   Serial.printf("{\"type\":\"generated\",\"node\":%u,\"boot\":%lu,\"seq\":%lu}\n",NODE_ID,(unsigned long)bootId,(unsigned long)p.seq);
   p.cost=route.cost; p.linkQ=p.linkRssi=NAN;
   if(parent>=0) { p.linkQ=neighbors[parent].q; p.linkRssi=neighbors[parent].rssi; }
-  p.temperature=p.humidity=p.lux=NAN;
-#if ENABLE_SENSORS
-  p.sensorMask=SENSOR_MASK;
-#endif
-#if ENABLE_SENSORS && (SENSOR_MASK & 1)
-  p.temperature=dht.readTemperature(); p.humidity=dht.readHumidity();
-  if(isfinite(p.temperature)&&isfinite(p.humidity)) p.valid|=1;
-#endif
-#if ENABLE_SENSORS && (SENSOR_MASK & 2)
-  if(lightOK) { p.lux=lightMeter.readLightLevel(); if(isfinite(p.lux)&&p.lux>=0) p.valid|=2; else p.lux=NAN; }
-#endif
-#if ENABLE_SENSORS && (SENSOR_MASK & 4)
-  p.motion=digitalRead(PIR_PIN)==HIGH; p.valid|=4;
-#endif
+  SensorReadings readings=sensorsRead();
+  p.temperature=readings.temperature; p.humidity=readings.humidity; p.lux=readings.lux;
+  p.motion=readings.motion; p.presence=readings.presence;
+  p.mq2Voltage=readings.mq2Voltage; p.dustVoltage=readings.dustVoltage; p.valid=readings.valid;
+  p.sensorMask=ENABLE_SENSORS?SENSOR_MASK:0;
   if(NODE_ID==ROOT_ID) deliver(p); else enqueue(p);
 }
 void appSetup() {
   Serial.begin(115200); bootId=esp_random(); if(!bootId) bootId=1;
   rxQueue=xQueueCreate(32,sizeof(Rx)); if(!rxQueue) { event("queue_init_failed"); return; }
   WiFi.mode(WIFI_STA); WiFi.setSleep(false);
-  if(esp_wifi_set_channel(RADIO_CHANNEL,WIFI_SECOND_CHAN_NONE)!=ESP_OK || esp_now_init()!=ESP_OK) {
+  if(esp_now_init()!=ESP_OK) {
     event("radio_init_failed"); return;
   }
   if(esp_now_register_recv_cb(receive)!=ESP_OK || !addPeer(broadcastMac)) { event("radio_setup_failed"); return; }
   route=makePacket(ADV); route.cost=INFINITY;
   if(NODE_ID==ROOT_ID) { route.count=1; route.path[0]=ROOT_ID; route.cost=0; route.epoch=bootId; }
-#if ENABLE_SENSORS && (SENSOR_MASK & 4)
-  pinMode(PIR_PIN,INPUT);
-#endif
-#if ENABLE_SENSORS && (SENSOR_MASK & 1)
-  dht.begin();
-#endif
-#if ENABLE_SENSORS && (SENSOR_MASK & 2)
-  Wire.begin(SDA_PIN,SCL_PIN);
-  lightOK=lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
-#endif
+  if(!startWifiUpload()) { event("wifi_task_failed"); return; }
+  sensorsBegin();
   nextAdv=millis()+esp_random()%500; lastSample=millis(); ready=true; event("boot");
 }
 void appLoop() {
   if(!ready) { delay(100); return; }
+  sensorsPoll();
+  static bool connectedBefore=false;
+  static int oldChannel=0;
+  bool connected=WiFi.status()==WL_CONNECTED;
+  if(!connected) {
+    connectedBefore=false;
+    if(age(millis(),lastSample)>=SAMPLE_MS) { lastSample=millis(); sample(); }
+    delay(2); return;
+  }
+  int channel=WiFi.channel();
+  if(!connectedBefore || channel!=oldChannel) {
+    flight.active=false;
+    for(auto &n:neighbors) { if(n.used) esp_now_del_peer(n.mac); n=Neighbor{}; }
+    xQueueReset(rxQueue); invalidate(); fastAdvertise();
+    connectedBefore=true; oldChannel=channel;
+  }
   Rx rx; unsigned handled=0;
   while(handled++<32 && xQueueReceive(rxQueue,&rx,0)==pdTRUE) handle(rx);
   serviceFlight(); uint32_t now=millis();

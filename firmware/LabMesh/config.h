@@ -21,19 +21,32 @@ inline float attemptEnergyMj(uint16_t next) {
   return NAN;
 }
 
-// Actual node 1 wiring from sensor_detector.ino. Check other boards individually!
+// Shared sensor interfaces on every board; manual channels are gated by the server.
 #ifndef ENABLE_SENSORS
 #define ENABLE_SENSORS 1
 #endif
-// Bit 1=DHT11, bit 2=BH1750, bit 4=PIR. Example: DHT+PIR => 5.
+// Bits: DHT11=1, BH1750=2, PIR=4, LD2410B=8, MQ2=16, dust=32.
 #ifndef SENSOR_MASK
-#define SENSOR_MASK 7
+#define SENSOR_MASK 63
 #endif
 constexpr int DHT_PIN = 5;
 constexpr int PIR_PIN = 15;
 constexpr int SDA_PIN = 8;
 constexpr int SCL_PIN = 9;
 constexpr uint32_t SAMPLE_MS = 5000;
+constexpr int RADAR_RX_PIN = 4; // Connect LD2410B TX here; OUT and RX unused.
+constexpr uint32_t RADAR_BAUD = 256000;
+constexpr uint32_t RADAR_TIMEOUT_MS = 2000;
+constexpr int MQ2_PIN = 1;
+constexpr int DUST_PIN = 2;
+constexpr int DUST_LED_PIN = 6; // BC337: 1k base series, 10k B-E pull-down; HIGH = on.
+constexpr float DUST_DIVIDER_GAIN = 2.0f; // Vo -> 10k -> ADC; ADC -> 10k -> GND.
+constexpr uint32_t DUST_SAMPLE_US = 280;
+constexpr uint32_t DUST_LATEST_START_US = 300;
+constexpr uint32_t DUST_LED_OFF_US = 320;
+constexpr uint32_t DUST_FRESH_MS = 1000;
+static_assert(DUST_SAMPLE_US < DUST_LATEST_START_US && DUST_LATEST_START_US < DUST_LED_OFF_US, "Invalid dust timing");
+
 
 constexpr unsigned MAX_NEIGHBORS = 8;
 constexpr unsigned MAX_PATH = 8; // max nodes in advertised path, including root
